@@ -61,8 +61,16 @@ def get_fields(document):
 
 def lambda_handler(event, context):
   bucket = os.getenv('BUCKET_NAME')
-  #file_name = event['queryStringParameters']['filename']
-  file_name = '0bbc35b1-198c-4538-ad56-ba3ffe265330.pdf'
+  file_name = event['queryStringParameters']['filename']
+  #file_name = '0bbc35b1-198c-4538-ad56-ba3ffe265330.pdf'
   document = call_textract(bucket, file_name)
   fields = get_fields(document)
-  print(fields)
+  return {
+    "statusCode": 200,
+    "body": json.dumps(fields),
+    "headers": {
+      "Access-Control-Allow-Origin": os.getenv('ACCESS_CONTROL_ALLOW_ORIGIN'),
+      "Access-Control-Allow-Methods": os.getenv('ACCESS_CONTROL_ALLOW_METHODS'),
+      "Access-Control-Allow-Headers": os.getenv('ACCESS_CONTROL_ALLOW_HEADERS')
+    }
+  }
