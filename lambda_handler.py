@@ -1,87 +1,68 @@
 import boto3
-from collections import defaultdict
-from urllib.parse import unquote_plus
-import json
 import os
+import json
+from trp.trp2_expense import TAnalyzeExpenseDocumentSchema
 
-def get_kv_map(bucket, key, queries):
-    # process using image bytes
-    client = boto3.client('textract')
-    query_list = [{'Text': query['Text']} for query in queries]
-    response = client.analyze_document(Document={'S3Object': {'Bucket': bucket, "Name": key}}, FeatureTypes=['QUERIES'], QueriesConfig={'Queries': query_list})
-    blocks = response['Blocks']
+client = boto3.client('textract')
 
-    # get key and value maps
-    key_map = {}
-    value_map = {}
-    block_map = {}
-    for block in blocks:
-        block_id = block['Id']
-        block_map[block_id] = block
-        if block['BlockType'] == "QUERY":
-            key_map[block_id] = block
-        elif block['BlockType'] == "QUERY_RESULT":
-            value_map[block_id] = block
+def call_textract_expense(bucket, key):
+  response = client.analyze_expense(
+    Document={'S3Object': {'Bucket': bucket, 'Name': key}}
+  )
+  return response
 
-    return key_map, value_map, block_map
+def call_textract(bucket, key):
+  j = call_textract_expense(bucket, key)
+  t_doc = TAnalyzeExpenseDocumentSchema().load(j)
+  return t_doc
 
+def parse_fields(table_fields, summary_fields, normalized_fields):
+  return {
+    "guideId": [f[key] for f in normalized_fields for key in f if key == 'INVOICE_RECEIPT_ID'][0],
+    "name": [f[key] for f in normalized_fields for key in f if key == 'RECEIVER_NAME'][0],
+    "value": [f[key] for f in normalized_fields for key in f if key == 'SUBTOTAL'][0],
+    "covenantName": [f[key] for f in normalized_fields for key in f if key == 'VENDOR_NAME'][0],
+    "authorizationDate": [f[key] for f in summary_fields for key in f if key.startswith('4. Data de Autorização')][0],
+    "dueDate": [f[key] for f in summary_fields for key in f if key.startswith("6 Data de validade da Senha")][0],
+    "clientId": [f[key] for f in summary_fields for key in f if key.startswith('8 Número da carteira')][0],
+    "treatment": list(map(lambda x: {"code": x['PRODUCT_CODE'], "label": x['ITEM'], "value": x['PRICE'], "quantity": x['QUANTITY']}, table_fields))
+  }
 
-def get_kv_relationship(key_map, value_map, block_map):
-    kvs = defaultdict(list)
-    for block_id, key_block in key_map.items():
-        value_block = find_value_block(key_block, value_map)
-        key = get_text(key_block)
-        val = get_text(value_block)
-        kvs[key].append(val)
-    return kvs
+def get_fields(document):
 
+  table_fields = []
+  normalized_fields_parsed = []
+  summary_fields = []
 
-def find_value_block(key_block, value_map):
-    for relationship in key_block['Relationships']:
-        if relationship['Type'] == 'ANSWER':
-            for value_id in relationship['Ids']:
-                value_block = value_map[value_id]
-    return value_block
+  for expense in document.expenses_documents:
+    for field in expense.summaryfields:
+      key = field.labeldetection.text if field.labeldetection else 'Unknown'
+      value = field.valuedetection.text if field.valuedetection else 'No value detected'
+      summary_fields.append({key: value})
 
+    for line_item_group in expense.lineitemgroups:
+      for line_item in line_item_group.lineitems:
+        newLine = {}
+        for expense_field in line_item.lineitem_expensefields:
+          key = expense_field.ftype.text if expense_field.ftype else 'Unknown'
+          value = expense_field.valuedetection.text if expense_field.valuedetection else 'No value detected'
+          newLine[key] = value
+        table_fields.append(newLine)
 
-def get_text(result):
-    text = ''
-    if result['BlockType'] == "QUERY":
-        text = result['Query']['Text']
-    elif result['BlockType'] == "QUERY_RESULT":
-        text = result['Text']
+  normalized_fields = document.get_normalized_summaryfields_by_expense_id(expense.expense_idx)
+  if normalized_fields:
+    for field in normalized_fields:
+      if field.valuedetection:
+        key = field.ftype.text if field.ftype else "UNKNOWN"
+        value = field.valuedetection.text
+        normalized_fields_parsed.append({key: value})
 
-    return text
+  return parse_fields(table_fields, summary_fields, normalized_fields_parsed)
 
 def lambda_handler(event, context):
-    bucket = os.getenv('BUCKET_NAME')
-    file_name = event['queryStringParameters']['filename']
-    print(bucket)
-    print(file_name)
-    print(event)
-    queries = [
-        {"Text": "What is numero guia no prestador?", "Key": "guideId"},
-        {"Text": "What is data da autorizacao?", "Key": "authorizationDate"},
-        {"Text": "What is valor total?", "Key": "value"},
-        {"Text": "What is nome?", "Key": "name"},
-        {"Text": "What is data de validade?", "Key": "dueDate"},
-        {"Text": "What is the name of the company that issued the document?", "Key": "covenantName"}
-    ]
-    key_map, value_map, block_map = get_kv_map( bucket, file_name, queries)
-
-    # Get Key Value relationship
-    kvs = get_kv_relationship(key_map, value_map, block_map)
-    response = {}
-    for key, value in kvs.items():
-        index = [q['Key'] for q in queries if q['Text'] == key][0]
-        response[index] = value[0]
-    print(response)
-    return {
-        "statusCode": 200,
-        "body": json.dumps(response),
-        "headers": {
-            "Access-Control-Allow-Origin": os.getenv('ACCESS_CONTROL_ALLOW_ORIGIN'),
-            "Access-Control-Allow-Methods": os.getenv('ACCESS_CONTROL_ALLOW_METHODS'),
-            "Access-Control-Allow-Headers": os.getenv('ACCESS_CONTROL_ALLOW_HEADERS')
-        }
-    }
+  bucket = os.getenv('BUCKET_NAME')
+  #file_name = event['queryStringParameters']['filename']
+  file_name = '0bbc35b1-198c-4538-ad56-ba3ffe265330.pdf'
+  document = call_textract(bucket, file_name)
+  fields = get_fields(document)
+  print(fields)
